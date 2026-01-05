@@ -1,0 +1,219 @@
+# GitHub Action: Generate Power BI Documentation
+#
+# This workflow automatically generates GitHub wiki documentation
+# whenever a PBIX file is updated in the repository.
+#
+# Prerequisites:
+# 1. Enable the wiki for your repository (Settings → Features → Wikis)
+# 2. Create at least one page manually to initialize the wiki repository
+# 3. Ensure GITHUB_TOKEN has write access (default for same-repo)
+#
+# Usage:
+# - Push a PBIX file to trigger automatic generation
+# - Use workflow_dispatch to manually trigger with custom PBIX path
+
+name: Generate Power BI Documentation
+
+on:
+  # Trigger on PBIX file changes
+  push:
+    paths:
+      - '**.pbix'
+      - '**.PBIX'
+    branches:
+      - main
+      - master
+  
+  # Allow manual triggers
+  workflow_dispatch:
+    inputs:
+      pbix_path:
+        description: 'Path to PBIX file (relative to repo root)'
+        required: true
+        default: 'models/SalesModel.pbix'
+        type: string
+      model_name:
+        description: 'Display name for the model (optional)'
+        required: false
+        type: string
+      include_hidden:
+        description: 'Include hidden tables/measures'
+        required: false
+        default: false
+        type: boolean
+
+# Prevent concurrent wiki updates
+concurrency:
+  group: wiki-generation
+  cancel-in-progress: false
+
+jobs:
+  generate-docs:
+    name: Generate Wiki Documentation
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+    
+    steps:
+      # ===========================================
+      # Checkout and Setup
+      # ===========================================
+      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mcp pbixray
+          
+          # Install project if requirements.txt exists
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+      
+      # ===========================================
+      # Identify PBIX Files
+      # ===========================================
+      
+      - name: Determine PBIX file to process
+        id: find-pbix
+        run: |
+          if [ -n "${{ github.event.inputs.pbix_path }}" ]; then
+            # Manual trigger - use provided path
+            PBIX_FILE="${{ github.event.inputs.pbix_path }}"
+            echo "Using manually specified file: $PBIX_FILE"
+          else
+            # Push trigger - find changed PBIX files
+            PBIX_FILE=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -i '\.pbix$' | head -1)
+            
+            if [ -z "$PBIX_FILE" ]; then
+              # Fallback: find any PBIX file
+              PBIX_FILE=$(find . -name "*.pbix" -o -name "*.PBIX" | head -1)
+            fi
+            
+            echo "Detected PBIX file: $PBIX_FILE"
+          fi
+          
+          if [ -z "$PBIX_FILE" ] || [ ! -f "$PBIX_FILE" ]; then
+            echo "::error::No PBIX file found to process"
+            exit 1
+          fi
+          
+          echo "pbix_file=$PBIX_FILE" >> $GITHUB_OUTPUT
+          
+          # Generate model name from filename if not provided
+          MODEL_NAME="${{ github.event.inputs.model_name }}"
+          if [ -z "$MODEL_NAME" ]; then
+            MODEL_NAME=$(basename "$PBIX_FILE" .pbix)
+          fi
+          echo "model_name=$MODEL_NAME" >> $GITHUB_OUTPUT
+      
+      # ===========================================
+      # Generate Wiki Content
+      # ===========================================
+      
+      - name: Generate wiki documentation
+        id: generate
+        run: |
+          echo "Generating documentation for: ${{ steps.find-pbix.outputs.pbix_file }}"
+          
+          # Build command
+          CMD="python generate_wiki.py"
+          CMD="$CMD '${{ steps.find-pbix.outputs.pbix_file }}'"
+          CMD="$CMD -o ./wiki-output"
+          CMD="$CMD -n '${{ steps.find-pbix.outputs.model_name }}'"
+          
+          if [ "${{ github.event.inputs.include_hidden }}" = "true" ]; then
+            CMD="$CMD --include-hidden"
+          fi
+          
+          # Run generator
+          eval $CMD
+          
+          # Verify output
+          if [ ! -f "./wiki-output/Home.md" ]; then
+            echo "::error::Wiki generation failed - Home.md not created"
+            exit 1
+          fi
+          
+          echo "Wiki files generated:"
+          ls -la ./wiki-output/
+      
+      # ===========================================
+      # Update Wiki Repository
+      # ===========================================
+      
+      - name: Checkout wiki repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Update wiki content
+        run: |
+          cd wiki
+          
+          # Remove existing markdown files (preserve .git)
+          find . -maxdepth 1 -name "*.md" -type f -delete
+          
+          # Copy new content
+          cp -r ../wiki-output/* .
+          
+          echo "Wiki content updated:"
+          ls -la
+      
+      - name: Commit and push wiki
+        run: |
+          cd wiki
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add -A
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to wiki content"
+            exit 0
+          fi
+          
+          # Commit with details
+          git commit -m "📚 Update documentation from ${GITHUB_SHA::7}" \
+            -m "Source: ${{ steps.find-pbix.outputs.pbix_file }}" \
+            -m "Triggered by: ${{ github.event_name }}" \
+            -m "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          git push
+          
+          echo "::notice::Wiki updated successfully!"
+      
+      # ===========================================
+      # Summary
+      # ===========================================
+      
+      - name: Generate job summary
+        run: |
+          echo "## 📊 Power BI Documentation Generated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Model | ${{ steps.find-pbix.outputs.model_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source | \`${{ steps.find-pbix.outputs.pbix_file }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Wiki | [View Documentation](${{ github.server_url }}/${{ github.repository }}/wiki) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Generated Pages" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ls -1 ./wiki-output/*.md >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
